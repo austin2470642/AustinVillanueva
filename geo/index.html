@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Object Detector</title>
+  <style>
+    body { font-family: Arial, sans-serif; }
+    #camera { position: relative; width: 640px; max-width: 100%; background: #111; }
+    video { display: block; width: 100%; height: auto; }
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    #status, #error, #detections { margin-top: 10px; }
+    #status { font-weight: bold; }
+    #error { color: #b00020; }
+  </style>
+  <script defer src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+</head>
+<body>
+  <h1>Object Detector</h1>
+  <p>Show an object to the camera. People are ignored. This model recognizes common COCO objects, but pens and ID cards are not supported classes and may be mislabeled.</p>
+  <button id="startButton" type="button">Start camera</button>
+  <button id="stopButton" type="button" disabled>Stop camera</button>
+  <label for="confidence">Minimum confidence:</label>
+  <input id="confidence" type="range" min="35" max="95" value="65">
+  <output id="confidenceValue">65%</output>
+  <p id="status" role="status">Camera is off.</p>
+  <p id="error" role="alert"></p>
+  <div id="camera">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="canvas"></canvas>
+  </div>
+  <h2>Objects found</h2>
+  <ul id="detections" aria-live="polite"></ul>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const status = document.getElementById('status');
+    const startButton = document.getElementById('startButton');
+    const stopButton = document.getElementById('stopButton');
+    const confidenceInput = document.getElementById('confidence');
+    const confidenceValue = document.getElementById('confidenceValue');
+    const detectionsList = document.getElementById('detections');
+    const error = document.getElementById('error');
+    let model;
+    let modelLoading;
+    let stream;
+    let animationFrame;
+    let detecting = false;
+
+    async function loadModel() {
+      if (model) return model;
+      if (!window.cocoSsd) {
+        throw new Error('The detector library did not load. Check your internet connection and reload the page.');
+      }
+      if (!modelLoading) {
+        modelLoading = window.cocoSsd.load({ base: 'mobilenet_v2' }).then(loadedModel => {
+          model = loadedModel;
+          return model;
+        }).catch(reason => {
+          modelLoading = undefined;
+          throw reason;
+        });
+      }
+      return modelLoading;
+    }
+
+    async function startCamera() {
+      error.textContent = '';
+      startButton.disabled = true;
+      status.textContent = 'Loading object detection model...';
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error('Camera access requires HTTPS or localhost.');
+        }
+        await loadModel();
+        status.textContent = 'Model ready. Requesting camera access...';
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 } }
+        });
+        video.srcObject = stream;
+        await new Promise(resolve => {
+          if (video.readyState >= HTMLMediaElement.HAVE_METADATA) resolve();
+          else video.addEventListener('loadedmetadata', resolve, { once: true });
+        });
+        await video.play();
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        startButton.disabled = false;
+        startButton.hidden = true;
+        stopButton.disabled = false;
+        status.textContent = 'Camera on. Looking for objects...';
+        animationFrame = requestAnimationFrame(detectFrame);
+      } catch (reason) {
+        if (stream) stream.getTracks().forEach(track => track.stop());
+        stream = undefined;
+        video.srcObject = null;
+        startButton.disabled = false;
+        stopButton.disabled = true;
+        status.textContent = 'Could not start the detector.';
+        error.textContent = reason.name === 'NotAllowedError'
+          ? 'Camera permission was denied. Allow camera access in your browser settings and try again.'
+          : reason.message || 'Check your internet connection and camera, then try again.';
+      }
+    }
+
+    async function detectFrame() {
+      if (!stream || detecting) return;
+      detecting = true;
+      try {
+        const threshold = Number(confidenceInput.value) / 100;
+        const predictions = await model.detect(video, 20, threshold);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const visiblePredictions = predictions.filter(item => item.class !== 'person' && item.score >= threshold);
+        for (const prediction of visiblePredictions) {
+          const [x, y, width, height] = prediction.bbox;
+          const label = `${prediction.class} (${Math.round(prediction.score * 100)}%)`;
+          ctx.font = '16px Arial';
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = '#00e676';
+          ctx.fillStyle = '#00e676';
+          ctx.strokeRect(x, y, width, height);
+          const labelY = Math.max(0, y - 24);
+          ctx.fillRect(x, labelY, ctx.measureText(label).width + 10, 24);
+          ctx.fillStyle = '#111';
+          ctx.fillText(label, x + 5, labelY + 17);
+        }
+        detectionsList.replaceChildren();
+        for (const prediction of visiblePredictions) {
+          const item = document.createElement('li');
+          item.textContent = `${prediction.class} - ${Math.round(prediction.score * 100)}%`;
+          detectionsList.appendChild(item);
+        }
+        status.textContent = visiblePredictions.length
+          ? `Found ${visiblePredictions.length} object${visiblePredictions.length === 1 ? '' : 's'}.`
+          : 'No objects recognized yet. Try moving the object closer or improving the lighting.';
+      } catch (reason) {
+        error.textContent = `Detection error: ${reason.message}`;
+        stopCamera();
+        return;
+      } finally {
+        detecting = false;
+      }
+      if (stream) animationFrame = requestAnimationFrame(detectFrame);
+    }
+
+    function stopCamera() {
+      if (animationFrame) cancelAnimationFrame(animationFrame);
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      stream = undefined;
+      video.srcObject = null;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      detectionsList.replaceChildren();
+      startButton.hidden = false;
+      startButton.disabled = false;
+      stopButton.disabled = true;
+      status.textContent = 'Camera is off.';
+    }
+
+    startButton.addEventListener('click', startCamera);
+    stopButton.addEventListener('click', stopCamera);
+    confidenceInput.addEventListener('input', () => {
+      confidenceValue.value = `${confidenceInput.value}%`;
+    });
+  </script>
+</body>
+</html>
